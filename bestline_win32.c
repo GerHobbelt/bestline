@@ -133,37 +133,25 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "bestline.h"
 
-#if !defined(_WIN32)
-#define _POSIX_C_SOURCE 1 /* so GCC builds in ANSI mode */
-#define _XOPEN_SOURCE 700 /* so GCC builds in ANSI mode */
-#define _DARWIN_C_SOURCE 1 /* so SIGWINCH / IUTF8 on XNU */
-#endif
+#if defined(_WIN32)
+
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#if !defined(_WIN32)
-#include <poll.h>
-#endif
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(_WIN32)
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#endif
 #include <sys/stat.h>
-#if !defined(_WIN32)
-#include <sys/time.h>
-#endif
 #include <sys/types.h>
-#if !defined(_WIN32)
-#include <termios.h>
-#include <unistd.h>
-#endif
+#include <winsock2.h>
+#include <windows.h>
+#include <io.h>
+#include <conio.h>
+
 #ifndef SIGWINCH
 #define SIGWINCH 28 /* GNU/Systemd + XNU + FreeBSD + NetBSD + OpenBSD */
 #endif
@@ -171,13 +159,27 @@
 #define IUTF8 0
 #endif
 
-#if defined(_WIN32)
 typedef signed long long int ssize_t;
+
+typedef int mode_t;
+
 struct winsize {
-	int rows;
-	int columns;
+	int ws_row;
+	int ws_col;
 };
+
+static char* strndup(const char* s, size_t len) {
+	char* dst = malloc(len + 1);
+	if (!dst)
+		return NULL;
+	if (len)
+		memcpy(dst, s, len);
+	dst[len] = 0;
+	return dst;
+}
+
 ssize_t getdelim(char** buf, size_t* len, int delim, FILE* f);
+
 /* posix_getline.c
  * RT-Thread POSIX
  * getdelim(), getline() - read a delimited record from stream, ersatz implementation
@@ -245,15 +247,6 @@ ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* stream) {
 	*cur_pos = '\0';
 	return (ssize_t)(cur_pos - *lineptr);
 }
-#endif // _WIN32
-
-#if defined(__GCC__)
-__asm__(".ident\t\"\\n\\n\
-Bestline (BSD-2)\\n\
-Copyright 2018-2020 Justine Tunney <jtunney@gmail.com>\\n\
-Copyright 2010-2016 Salvatore Sanfilippo <antirez@gmail.com>\\n\
-Copyright 2010-2013 Pieter Noordhuis <pcnoordhuis@gmail.com>\"");
-#endif
 
 #ifndef BESTLINE_MAX_RING
 #define BESTLINE_MAX_RING 8
@@ -331,11 +324,6 @@ static char ispaused;
 static char iscapital;
 static unsigned historylen;
 static struct bestlineRing ring;
-#if defined(_WIN32)
-static struct sigaction orig_cont;
-static struct sigaction orig_winch;
-static struct termios orig_termios;
-#endif
 static char *history[BESTLINE_MAX_HISTORY];
 static bestlineXlatCallback *xlatCallback;
 static bestlineHintsCallback *hintsCallback;
@@ -629,7 +617,7 @@ int bestlineCharacterWidth(int c) {
  * other things like blocks and emoji (So).
  */
 char bestlineIsSeparator(unsigned c) {
-    int m, l, r, n;
+    int l, r, n;
     if (c < 0200) {
         return !(('0' <= c && c <= '9') || ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z'));
     }
@@ -1919,14 +1907,8 @@ static char *GetLineChar(int fin, int fout) {
     ssize_t rc;
     char seq[16];
     struct abuf a;
-    struct sigaction sa[3];
     abInit(&a);
     gotint = 0;
-    sigemptyset(&sa->sa_mask);
-    sa->sa_flags = 0;
-    sa->sa_handler = bestlineOnInt;
-    sigaction(SIGINT, sa, sa + 1);
-    sigaction(SIGQUIT, sa, sa + 2);
     for (;;) {
         if (gotint) {
             rc = -1;
@@ -1980,8 +1962,6 @@ static char *GetLineChar(int fin, int fout) {
             abAppend(&a, seq, got);
         }
     }
-    sigaction(SIGQUIT, sa + 2, 0);
-    sigaction(SIGINT, sa + 1, 0);
     if (gotint) {
         abFree(&a);
         raise(gotint);
@@ -2152,29 +2132,11 @@ static int bestlineIsUnsupportedTerm(void) {
 }
 
 static int enableRawMode(int fd) {
-    struct termios raw;
-    struct sigaction sa;
-    if (tcgetattr(fd, &orig_termios) != -1) {
-        raw = orig_termios;
-        raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-        raw.c_iflag |= IUTF8;
-        raw.c_cflag |= CS8;
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        if (tcsetattr(fd, TCSANOW, &raw) != -1) {
-            sa.sa_flags = 0;
-            sa.sa_handler = bestlineOnCont;
-            sigemptyset(&sa.sa_mask);
-            sigaction(SIGCONT, &sa, &orig_cont);
-            sa.sa_handler = bestlineOnWinch;
-            sigaction(SIGWINCH, &sa, &orig_winch);
-            rawmode = fd;
-            gotwinch = 0;
-            gotcont = 0;
-            return 0;
-        }
-    }
+    rawmode = fd;
+    gotwinch = 0;
+    gotcont = 0;
+    return 0;
+
     errno = ENOTTY;
     return -1;
 }
@@ -2189,8 +2151,6 @@ static void bestlineUnpause(int fd) {
 void bestlineDisableRawMode(void) {
     if (rawmode != -1) {
         bestlineUnpause(rawmode);
-        sigaction(SIGCONT, &orig_cont, 0);
-        sigaction(SIGWINCH, &orig_winch, 0);
         tcsetattr(rawmode, TCSANOW, &orig_termios);
         rawmode = -1;
     }
@@ -2296,10 +2256,11 @@ static struct winsize GetTerminalSize(struct winsize ws, int ifd, int ofd) {
         ws.ws_col = x;
     }
     if (((!ws.ws_col || !ws.ws_row) && bestlineRead(ifd, 0, 0, 0) != -1 &&
-         bestlineWriteStr(ofd, "\0337" /* save position */
-                               "\033[9979;9979H" /* move cursor to bottom right corner */
-                               "\033[6n" /* report position */
-                               "\0338") != -1 && /* restore position */
+		 // fix warning C4125 : decimal digit terminates octal escape sequence
+         bestlineWriteStr(ofd, "\033" "7" /* save position */
+                               "\033" "[9979;9979H" /* move cursor to bottom right corner */
+                               "\033" "[6n" /* report position */
+                               "\033" "8") != -1 && /* restore position */
          (n = bestlineRead(ifd, b, sizeof(b), 0)) != -1 &&
          n && b[0] == 033 && b[1] == '[' && b[n - 1] == 'R')) {
         p = b + 2;
@@ -3863,24 +3824,16 @@ char *bestlineRawInit(const char *prompt, const char *init, int infd, int outfd)
     char *buf;
     ssize_t rc;
     static char once;
-    struct sigaction sa[3];
     if (!once)
         atexit(bestlineAtExit), once = 1;
     if (enableRawMode(infd) == -1)
         return 0;
     buf = 0;
     gotint = 0;
-    sigemptyset(&sa->sa_mask);
-    sa->sa_flags = 0;
-    sa->sa_handler = bestlineOnInt;
-    sigaction(SIGINT, sa, sa + 1);
-    sigaction(SIGQUIT, sa, sa + 2);
     bestlineWriteStr(outfd, "\033[?2004h"); // enable bracketed paste mode
     rc = bestlineEdit(infd, outfd, prompt, init, &buf);
     bestlineWriteStr(outfd, "\033[?2004l"); // disable bracketed paste mode
     bestlineDisableRawMode();
-    sigaction(SIGQUIT, sa + 2, 0);
-    sigaction(SIGINT, sa + 1, 0);
     if (gotint) {
         free(buf);
         buf = 0;
@@ -4180,3 +4133,5 @@ void bestlineUserIO(int (*userReadFn)(int, void *, int), int (*userWriteFn)(int,
     else
         _MyPoll = MyPoll;
 }
+
+#endif // _WIN32
